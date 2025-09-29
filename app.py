@@ -190,9 +190,6 @@ button[data-testid*="clear"]:hover {
 </style>
 """, unsafe_allow_html=True)
 
-
-
-
 # ---------- Import processing helpers ----------
 MAIN_AVAILABLE = True
 _import_error = None
@@ -241,10 +238,17 @@ def process_permit(file_path):
         raise ValueError(f"Unsupported file type: {ext}")
 
 def _file_sig(path):
+    """Get file signature with better error handling and stability"""
     try:
+        if not os.path.exists(path):
+            return None
         stat = os.stat(path)
-        return (stat.st_size, int(stat.st_mtime))
-    except FileNotFoundError:
+        # Add a small delay for newly created files to stabilize
+        if time.time() - stat.st_mtime < 0.5:
+            time.sleep(0.1)
+            stat = os.stat(path)  # Re-read after delay
+        return (stat.st_size, int(stat.st_mtime * 1000))  # Include milliseconds for better precision
+    except (FileNotFoundError, OSError):
         return None
 
 def excel_bytes_for_single_doc(data: dict) -> bytes:
@@ -287,59 +291,133 @@ def excel_bytes_for_all_docs(cache: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# ---------- Upload ----------
+# ---------- Upload and Cache Management ----------
 uploaded_files = st.file_uploader("", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
-saved_paths = []
+
+# Initialize cache and upload tracking
+if "cache" not in st.session_state:
+    st.session_state["cache"] = {}  # { path: { "sig": (size, mtime), "result": dict } }
+
+if "selected_file_path" not in st.session_state:
+    st.session_state["selected_file_path"] = None
+
+if "uploaded_file_names" not in st.session_state:
+    st.session_state["uploaded_file_names"] = set()
+
+# Track newly uploaded files with better detection
+newly_uploaded = []
 if uploaded_files:
-    saved_paths = save_uploaded_files(uploaded_files)
-    st.success(f"Saved {len(saved_paths)} uploaded file(s) to `{INPUT_FOLDER}`")
+    current_upload_names = set(f.name for f in uploaded_files)
+    
+    # Only process truly new files (not just reruns)
+    if current_upload_names != st.session_state["uploaded_file_names"]:
+        saved_paths = save_uploaded_files(uploaded_files)
+        newly_uploaded = saved_paths.copy()
+        st.session_state["uploaded_file_names"] = current_upload_names
+        st.success(f"Saved {len(saved_paths)} uploaded file(s) to `{INPUT_FOLDER}`")
+        
+        # Force cache invalidation for newly uploaded files
+        for path in newly_uploaded:
+            if path in st.session_state["cache"]:
+                del st.session_state["cache"][path]
 
 if not MAIN_AVAILABLE:
-    st.error("Error importing processing functions from main.py — processing disabled.")
+    st.error("Error importing processing functions from main.py – processing disabled.")
     st.code(_import_error)
     st.stop()
 
-all_files = sorted({os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER)} | set(saved_paths))
+# Get all files (existing + newly uploaded)
+all_files = sorted({os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER) if os.path.isfile(os.path.join(INPUT_FOLDER, f))})
 if not all_files:
     st.info("No files available. Upload a PDF or image above to get started.")
     st.stop()
 
-# ---------- Cache ----------
-if "cache" not in st.session_state:
-    st.session_state["cache"] = {}  # { path: { "sig": (size, mtime), "result": dict } }
+# ---------- Smart Cache Check ----------
+def needs_processing(file_path):
+    """Check if a file needs processing based on file signature and cache state"""
+    current_sig = _file_sig(file_path)
+    if current_sig is None:
+        return False  # File doesn't exist
+    
+    cache_entry = st.session_state["cache"].get(file_path)
+    if cache_entry is None:
+        return True  # Never processed
+    
+    cached_sig = cache_entry.get("sig")
+    if cached_sig != current_sig:
+        return True  # File changed
+    
+    # Check if result exists
+    if cache_entry.get("result") is None:
+        return True  # Processing failed previously
+    
+    return False
 
-# ---------- Batch process unprocessed files ----------
-def batch_process(paths):
+# ---------- Improved Batch Processing ----------
+def batch_process(paths, force_process=False):
     if not paths:
         return
+    
     progress_holder = st.empty()
     with st.spinner(f"Processing {len(paths)} document(s)…"):
         progress = progress_holder.progress(0, text="Starting…")
         completed, total = 0, len(paths)
+        
+        def process_single_file(p):
+            try:
+                return process_permit(p)
+            except Exception as e:
+                st.warning(f"Failed to process {os.path.basename(p)}: {e}")
+                st.code(traceback.format_exc())
+                return None
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, total)) as ex:
-            futures = {ex.submit(process_permit, p): p for p in paths}
+            futures = {ex.submit(process_single_file, p): p for p in paths}
+            
             for fut in concurrent.futures.as_completed(futures):
                 p = futures[fut]
-                res = None
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    st.warning(f"Failed to process {os.path.basename(p)}: {e}")
-                    st.code(traceback.format_exc())
-                st.session_state["cache"][p] = {"sig": _file_sig(p), "result": res}
+                res = fut.result()
+                
+                # Update cache with new signature and result
+                current_sig = _file_sig(p)
+                st.session_state["cache"][p] = {
+                    "sig": current_sig, 
+                    "result": res,
+                    "processed_at": time.time()  # Add timestamp for debugging
+                }
+                
                 completed += 1
                 progress.progress(int(completed/total*100), text=f"Processed {completed}/{total}")
                 time.sleep(0.02)
+        
         progress_holder.empty()
 
+# ---------- Process Files ----------
+# For newly uploaded files, give them more time to stabilize
+if newly_uploaded:
+    time.sleep(0.3)  # Longer pause to ensure files are fully written
+    
+    # Verify files are actually written and accessible
+    verified_uploads = []
+    for p in newly_uploaded:
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            verified_uploads.append(p)
+        else:
+            st.warning(f"File {os.path.basename(p)} may not have been saved correctly")
+    newly_uploaded = verified_uploads
+
+# Check which files need processing
 pending = []
 for p in all_files:
-    sig = _file_sig(p)
-    entry = st.session_state["cache"].get(p)
-    if (entry is None) or (entry.get("sig") != sig):
+    # Force processing of newly uploaded files regardless of cache
+    if p in newly_uploaded:
         pending.append(p)
-batch_process(pending)
+    elif needs_processing(p):
+        pending.append(p)
 
+# Process pending files
+if pending:
+    batch_process(pending)
 
 # ---------- Enhanced Sidebar ----------
 total = len(all_files)
@@ -348,9 +426,7 @@ processed = sum(1 for p in all_files if st.session_state["cache"].get(p, {}).get
 with st.sidebar:
     # Header
     st.title("📁 Document Library")
-    # st.markdown('<div class="sb-div"></div>', unsafe_allow_html=True)
     st.divider()
-
 
     col1, col2 = st.columns([0.5, 15.5])
        
@@ -358,7 +434,7 @@ with st.sidebar:
         st.markdown("", unsafe_allow_html=True)  # Spacer
     
     with col2:
-                # Search (indented)
+        # Search (indented)
         st.markdown('<div class="sb-label"><b>Find document:</b></div>', unsafe_allow_html=True)
         q = st.text_input("", placeholder="Search by filename..", key="sb_search")
 
@@ -386,12 +462,17 @@ with st.sidebar:
                 key="sb_file_select_idx",
             )
             selected_path = display_files[selected_idx]
+            
+            # Only update session state if actually changed
+            if st.session_state["selected_file_path"] != selected_path:
+                st.session_state["selected_file_path"] = selected_path
+                
         elif q:  # If there's a search query but no results
             st.info("Try a different search term")
-            selected_path = None
+            selected_path = st.session_state.get("selected_file_path")
         else:
             st.info("No files available.")
-            selected_path = None
+            selected_path = st.session_state.get("selected_file_path")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -400,14 +481,16 @@ with st.sidebar:
             # Status + metadata (centered, light gray, smaller)
             entry = st.session_state["cache"].get(selected_path)
             status_icon = "Processed" if (entry and entry.get("result")) else ("Not yet processed" if (entry and "result" in entry and entry.get("result") is None) else "Processing…")
-            stat = os.stat(selected_path)
-            file_kind = "PDF" if selected_path.lower().endswith(".pdf") else "Image"
-            size_kb = stat.st_size // 1024
             
-            st.markdown(
-                f'<div class="sb-help">Status: {status_icon} • Type: {file_kind} • Size: {size_kb} KB</div>',
-                unsafe_allow_html=True
-            )
+            if os.path.exists(selected_path):
+                stat = os.stat(selected_path)
+                file_kind = "PDF" if selected_path.lower().endswith(".pdf") else "Image"
+                size_kb = stat.st_size // 1024
+                
+                st.markdown(
+                    f'<div class="sb-help">Status: {status_icon} • Type: {file_kind} • Size: {size_kb} KB</div>',
+                    unsafe_allow_html=True
+                )
 
         st.divider()
 
@@ -430,9 +513,11 @@ with st.sidebar:
         st.session_state["cache"].clear()
         st.rerun()
 
+# Use the stored selected_path for the rest of your logic
+selected_path = st.session_state.get("selected_file_path")
 
 # ---------- Fetch selected result ----------
-result = st.session_state["cache"].get(selected_path, {}).get("result")
+result = st.session_state["cache"].get(selected_path, {}).get("result") if selected_path else None
 
 # ---------- Main layout ----------
 st.divider()
@@ -441,44 +526,46 @@ col1, col2, col3 = st.columns([30, 1, 40])
 # Preview
 with col1:
     st.subheader("Document Preview")
-    tab_original, tab_processed = st.tabs(["Original Image", "Processed Image"])
-    ext = os.path.splitext(selected_path)[1].lower()
+    if selected_path and os.path.exists(selected_path):
+        tab_original, tab_processed = st.tabs(["Original Image", "Processed Image"])
+        ext = os.path.splitext(selected_path)[1].lower()
 
-    with tab_original:
-        if ext == ".pdf":
-            st.info("Original is a PDF. You can download and view the original.")
-            st.download_button(
-                "⬇️ Download Original PDF",
-                data=open(selected_path, "rb"),
-                file_name=os.path.basename(selected_path),
-            )
-        else:
-            try:
-                st.image(selected_path, use_container_width=True)
-            except Exception:
-                st.write("Preview not available for this image type.")
+        with tab_original:
+            if ext == ".pdf":
+                st.info("Original is a PDF. You can download and view the original.")
                 st.download_button(
-                    "⬇️ Download Original Image",
+                    "⬇️ Download Original PDF",
                     data=open(selected_path, "rb"),
                     file_name=os.path.basename(selected_path),
                 )
-
-    with tab_processed:
-        if ext == ".pdf":
-            base = os.path.splitext(os.path.basename(selected_path))[0]
-            page1_path = os.path.join(OUTPUT_PDF_IMAGES, f"{base}_page_1.png")
-            if os.path.exists(page1_path):
-                st.image(page1_path, use_container_width=True)
             else:
-                st.info("Processed preview will appear here after processing.")
-        else:
-            base = os.path.splitext(os.path.basename(selected_path))[0]
-            processed_path = os.path.join(OUTPUT_PROCESSED_IMAGES, f"{base}_processed.png")
-            if os.path.exists(processed_path):
-                st.image(processed_path, use_container_width=True)
-            else:
-                st.info("Processed preview will appear here after processing.")
+                try:
+                    st.image(selected_path, use_container_width=True)
+                except Exception:
+                    st.write("Preview not available for this image type.")
+                    st.download_button(
+                        "⬇️ Download Original Image",
+                        data=open(selected_path, "rb"),
+                        file_name=os.path.basename(selected_path),
+                    )
 
+        with tab_processed:
+            if ext == ".pdf":
+                base = os.path.splitext(os.path.basename(selected_path))[0]
+                page1_path = os.path.join(OUTPUT_PDF_IMAGES, f"{base}_page_1.png")
+                if os.path.exists(page1_path):
+                    st.image(page1_path, use_container_width=True)
+                else:
+                    st.info("Processed preview will appear here after processing.")
+            else:
+                base = os.path.splitext(os.path.basename(selected_path))[0]
+                processed_path = os.path.join(OUTPUT_PROCESSED_IMAGES, f"{base}_processed.png")
+                if os.path.exists(processed_path):
+                    st.image(processed_path, use_container_width=True)
+                else:
+                    st.info("Processed preview will appear here after processing.")
+    else:
+        st.info("No file selected or file not found.")
 
 with col2:
     st.markdown("", unsafe_allow_html=True)  # Spacer
@@ -488,6 +575,8 @@ with col3:
     st.subheader("Extracted Data (editable)")
     if not result:
         st.info("No extracted data yet. If you just uploaded, processing should complete shortly.")
+    elif not selected_path:
+        st.info("Please select a document from the sidebar.")
     else:
         tabs = st.tabs(["Business Permit Details", "Cleaned Text", "Raw Extracted Text"])
         file_key = os.path.basename(selected_path)
