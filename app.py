@@ -1,4 +1,4 @@
-# app.py
+# app.py - Updated with bold labels, new fields, and date format changes
 import streamlit as st
 import os
 import io
@@ -6,12 +6,12 @@ import json
 import pandas as pd
 import traceback
 import time
-import concurrent.futures  # parallel processing
+import concurrent.futures
 
-st.set_page_config(page_title="Business Permit Data Extractor", layout="wide")
-st.title("🏢 Business Permit Data Extractor")
+st.set_page_config(page_title="Business Permit Data Intelligence Engine", layout="wide", initial_sidebar_state="expanded")
+st.title("🏢 Business Permit Data Intelligence Engine")
 
-# ---------- Sidebar aesthetic tweaks ----------
+# ---------- Sidebar aesthetic tweaks + Bold field labels ----------
 st.markdown("""
 <style>
 /* ===== Missing CSS Classes ===== */
@@ -33,6 +33,12 @@ st.markdown("""
 
 .sb-group {
   margin: 0.25rem 0;
+}
+
+/* ===== BOLD FIELD LABELS ===== */
+div[data-testid="stTextInput"] label,
+div[data-testid="stTextArea"] label {
+    font-weight: 800 !important;
 }
 
 /* ===== SIDEBAR BUTTONS ===== */
@@ -108,7 +114,6 @@ st.markdown("""
 }
 
 /* ===== MAIN CONTENT BUTTONS ===== */
-/* Primary buttons (Update Record, Export buttons) */
 .stButton > button[kind="primary"],
 .stDownloadButton > button,
 button[data-testid*="update_record"],
@@ -142,7 +147,7 @@ button[data-testid*="dl_raw"]:hover {
   box-shadow: 0 4px 8px rgba(191, 67, 66, 0.3) !important;
 }
 
-/* Secondary buttons (other actions) */
+/* Secondary buttons */
 .stButton > button[kind="secondary"],
 button[data-testid*="reprocess"],
 button[data-testid*="clear"] {
@@ -194,7 +199,6 @@ button[data-testid*="clear"]:hover {
 MAIN_AVAILABLE = True
 _import_error = None
 try:
-    # main.py defines process_pdf, process_image, flatten_json
     from main import process_pdf, process_image, flatten_json
 except Exception:
     MAIN_AVAILABLE = False
@@ -238,24 +242,23 @@ def process_permit(file_path):
         raise ValueError(f"Unsupported file type: {ext}")
 
 def _file_sig(path):
-    """Get file signature with better error handling and stability"""
     try:
         if not os.path.exists(path):
             return None
         stat = os.stat(path)
-        # Add a small delay for newly created files to stabilize
         if time.time() - stat.st_mtime < 0.5:
             time.sleep(0.1)
-            stat = os.stat(path)  # Re-read after delay
-        return (stat.st_size, int(stat.st_mtime * 1000))  # Include milliseconds for better precision
+            stat = os.stat(path)
+        return (stat.st_size, int(stat.st_mtime * 1000))
     except (FileNotFoundError, OSError):
         return None
 
 def excel_bytes_for_single_doc(data: dict) -> bytes:
     cols = [
-        "Municipal_City_Template","Document_Type","Page_Count","Name_of_file",
+        "Municipality_Template","Document_Type","Page_Count","Name_of_file",
         "Municipality_City","Business_Owner_Name","Mayor_Name","Business_Name",
-        "Other_Official_Names","Other_Officials","Permit_Number","Issue_Date","Business_Type",
+        "Business_Address","Other_Official_Names","Other_Officials","Permit_Number",
+        "Issue_Date","Business_Permit_Validity","Business_Type",
         "raw_text","cleaned_text"
     ]
     row = {c: data.get(c, "") for c in cols}
@@ -270,9 +273,10 @@ def excel_bytes_for_single_doc(data: dict) -> bytes:
 
 def excel_bytes_for_all_docs(cache: dict) -> bytes:
     cols = [
-        "Municipal_City_Template","Document_Type","Page_Count","Name_of_file",
+        "Municipality_Template","Document_Type","Page_Count","Name_of_file",
         "Municipality_City","Business_Owner_Name","Mayor_Name","Business_Name",
-        "Other_Official_Names","Other_Officials","Permit_Number","Issue_Date","Business_Type",
+        "Business_Address","Other_Official_Names","Other_Officials","Permit_Number",
+        "Issue_Date","Business_Permit_Validity","Business_Type",
         "raw_text","cleaned_text"
     ]
     rows = []
@@ -294,9 +298,8 @@ def excel_bytes_for_all_docs(cache: dict) -> bytes:
 # ---------- Upload and Cache Management ----------
 uploaded_files = st.file_uploader("", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
 
-# Initialize cache and upload tracking
 if "cache" not in st.session_state:
-    st.session_state["cache"] = {}  # { path: { "sig": (size, mtime), "result": dict } }
+    st.session_state["cache"] = {}
 
 if "selected_file_path" not in st.session_state:
     st.session_state["selected_file_path"] = None
@@ -304,19 +307,16 @@ if "selected_file_path" not in st.session_state:
 if "uploaded_file_names" not in st.session_state:
     st.session_state["uploaded_file_names"] = set()
 
-# Track newly uploaded files with better detection
 newly_uploaded = []
 if uploaded_files:
     current_upload_names = set(f.name for f in uploaded_files)
     
-    # Only process truly new files (not just reruns)
     if current_upload_names != st.session_state["uploaded_file_names"]:
         saved_paths = save_uploaded_files(uploaded_files)
         newly_uploaded = saved_paths.copy()
         st.session_state["uploaded_file_names"] = current_upload_names
         st.success(f"Saved {len(saved_paths)} uploaded file(s) to `{INPUT_FOLDER}`")
         
-        # Force cache invalidation for newly uploaded files
         for path in newly_uploaded:
             if path in st.session_state["cache"]:
                 del st.session_state["cache"][path]
@@ -326,34 +326,29 @@ if not MAIN_AVAILABLE:
     st.code(_import_error)
     st.stop()
 
-# Get all files (existing + newly uploaded)
 all_files = sorted({os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER) if os.path.isfile(os.path.join(INPUT_FOLDER, f))})
 if not all_files:
     st.info("No files available. Upload a PDF or image above to get started.")
     st.stop()
 
-# ---------- Smart Cache Check ----------
 def needs_processing(file_path):
-    """Check if a file needs processing based on file signature and cache state"""
     current_sig = _file_sig(file_path)
     if current_sig is None:
-        return False  # File doesn't exist
+        return False
     
     cache_entry = st.session_state["cache"].get(file_path)
     if cache_entry is None:
-        return True  # Never processed
+        return True
     
     cached_sig = cache_entry.get("sig")
     if cached_sig != current_sig:
-        return True  # File changed
+        return True
     
-    # Check if result exists
     if cache_entry.get("result") is None:
-        return True  # Processing failed previously
+        return True
     
     return False
 
-# ---------- Improved Batch Processing ----------
 def batch_process(paths, force_process=False):
     if not paths:
         return
@@ -378,12 +373,11 @@ def batch_process(paths, force_process=False):
                 p = futures[fut]
                 res = fut.result()
                 
-                # Update cache with new signature and result
                 current_sig = _file_sig(p)
                 st.session_state["cache"][p] = {
                     "sig": current_sig, 
                     "result": res,
-                    "processed_at": time.time()  # Add timestamp for debugging
+                    "processed_at": time.time()
                 }
                 
                 completed += 1
@@ -392,12 +386,9 @@ def batch_process(paths, force_process=False):
         
         progress_holder.empty()
 
-# ---------- Process Files ----------
-# For newly uploaded files, give them more time to stabilize
 if newly_uploaded:
-    time.sleep(0.3)  # Longer pause to ensure files are fully written
+    time.sleep(0.3)
     
-    # Verify files are actually written and accessible
     verified_uploads = []
     for p in newly_uploaded:
         if os.path.exists(p) and os.path.getsize(p) > 0:
@@ -406,55 +397,46 @@ if newly_uploaded:
             st.warning(f"File {os.path.basename(p)} may not have been saved correctly")
     newly_uploaded = verified_uploads
 
-# Check which files need processing
 pending = []
 for p in all_files:
-    # Force processing of newly uploaded files regardless of cache
     if p in newly_uploaded:
         pending.append(p)
     elif needs_processing(p):
         pending.append(p)
 
-# Process pending files
 if pending:
     batch_process(pending)
 
-# ---------- Enhanced Sidebar ----------
 total = len(all_files)
 processed = sum(1 for p in all_files if st.session_state["cache"].get(p, {}).get("result") is not None)
 
 with st.sidebar:
-    # Header
     st.title("📁 Document Library")
     st.divider()
 
     col1, col2 = st.columns([0.5, 15.5])
        
     with col1:
-        st.markdown("", unsafe_allow_html=True)  # Spacer
+        st.markdown("", unsafe_allow_html=True)
     
     with col2:
-        # Search (indented)
         st.markdown('<div class="sb-label"><b>Find document:</b></div>', unsafe_allow_html=True)
         q = st.text_input("", placeholder="Search by filename..", key="sb_search")
 
-        # Filter files based on search (if needed)
         if q:
             filtered_files = [p for p in all_files if q.lower() in os.path.basename(p).lower()]
             if filtered_files:
                 display_files = filtered_files
             else:
-                # Show no results message instead of falling back to all files
                 st.info(f"No matches for '{q}'")
                 display_files = []
         else:
             display_files = all_files
 
-        # File chooser (indented)
         st.markdown('<div class="sb-group">', unsafe_allow_html=True)
         st.markdown('<div class="sb-label"><b>Select document:</b></div>', unsafe_allow_html=True)
 
-        if display_files:  # Make sure we have files to display
+        if display_files:
             selected_idx = st.radio(
                 "",
                 options=list(range(len(display_files))),
@@ -463,11 +445,10 @@ with st.sidebar:
             )
             selected_path = display_files[selected_idx]
             
-            # Only update session state if actually changed
             if st.session_state["selected_file_path"] != selected_path:
                 st.session_state["selected_file_path"] = selected_path
                 
-        elif q:  # If there's a search query but no results
+        elif q:
             st.info("Try a different search term")
             selected_path = st.session_state.get("selected_file_path")
         else:
@@ -476,9 +457,7 @@ with st.sidebar:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # Only show status if we have a selected file
         if selected_path:
-            # Status + metadata (centered, light gray, smaller)
             entry = st.session_state["cache"].get(selected_path)
             status_icon = "Processed" if (entry and entry.get("result")) else ("Not yet processed" if (entry and "result" in entry and entry.get("result") is None) else "Processing…")
             
@@ -494,7 +473,6 @@ with st.sidebar:
 
         st.divider()
 
-    # Buttons with reduced spacing (indented under Document Library)
     all_excel = excel_bytes_for_all_docs(st.session_state["cache"])
 
     st.download_button(
@@ -513,17 +491,12 @@ with st.sidebar:
         st.session_state["cache"].clear()
         st.rerun()
 
-# Use the stored selected_path for the rest of your logic
 selected_path = st.session_state.get("selected_file_path")
-
-# ---------- Fetch selected result ----------
 result = st.session_state["cache"].get(selected_path, {}).get("result") if selected_path else None
 
-# ---------- Main layout ----------
 st.divider()
 col1, col2, col3 = st.columns([30, 1, 40])
 
-# Preview
 with col1:
     st.subheader("Document Preview")
     if selected_path and os.path.exists(selected_path):
@@ -568,9 +541,8 @@ with col1:
         st.info("No file selected or file not found.")
 
 with col2:
-    st.markdown("", unsafe_allow_html=True)  # Spacer
+    st.markdown("", unsafe_allow_html=True)
 
-# Extracted data & tabs
 with col3:
     st.subheader("Extracted Data (editable)")
     if not result:
@@ -581,19 +553,23 @@ with col3:
         tabs = st.tabs(["Business Permit Details", "Cleaned Text", "Raw Extracted Text"])
         file_key = os.path.basename(selected_path)
 
-        # --- TAB 1: Business Permit Details ---
         with tabs[0]:
             business_name = st.text_input(
-                "Business Establishment", result.get("Business_Name", ""), key=f"{file_key}_business_name"
+                "**Business Name/Establishment**", result.get("Business_Name", ""), key=f"{file_key}_business_name"
             )
             owner_name = st.text_input(
-                "Business Owner (Individual)", result.get("Business_Owner_Name", ""), key=f"{file_key}_owner_name"
+                "**Business Owner**", result.get("Business_Owner_Name", ""), key=f"{file_key}_owner_name",
+                help="Individual name or business entity name"
+            )
+            business_address = st.text_area(
+                "**Business Address**", result.get("Business_Address", ""), key=f"{file_key}_business_address",
+                height=80
             )
             mayor_name = st.text_input(
-                "Mayor Name", result.get("Mayor_Name", ""), key=f"{file_key}_mayor_name"
+                "**Mayor Name**", result.get("Mayor_Name", ""), key=f"{file_key}_mayor_name",
+                help="Title is included if present (e.g., Atty.)"
             )
 
-            # Other officials as "Name - Title" lines
             if isinstance(result.get("Other_Officials"), list) and result.get("Other_Officials"):
                 formatted_officials = "\n".join(
                     f"{o.get('name','').strip()} - {o.get('title','').strip()}".strip(" -")
@@ -614,28 +590,35 @@ with col3:
                 formatted_officials = "\n".join(normalized)
 
             other_officials_text = st.text_area(
-                "Other Official Names (city officials, witnesses)",
+                "**Other Official Names**",
                 formatted_officials,
                 key=f"{file_key}_other_officials",
                 height=150,
-                help="One per line, formatted as: Name - Title"
+                help="One per line, formatted as: Name - Title (include titles like Atty., Engr.)"
             )
 
             municipality_template = st.text_input(
-                "Municipal/City Template",
-                result.get("Municipal_City_Template", result.get("Municipality_City", "")),
+                "**Municipality Template**",
+                result.get("Municipality_Template", result.get("Municipality_City", "")),
                 key=f"{file_key}_municipal_template",
             )
             permit_number = st.text_input(
-                "Permit Number", result.get("Permit_Number", ""), key=f"{file_key}_permit_number"
+                "**Permit Number**", result.get("Permit_Number", ""), key=f"{file_key}_permit_number"
             )
             issue_date = st.text_input(
-                "Issue Date",
-                result.get("Issue_Date", result.get("Issue_Date", "")),
+                "**Issue Date**",
+                result.get("Issue_Date", ""),
                 key=f"{file_key}_issue_date",
+                help="Format: dd-mmm-yyyy (e.g., 15-Mar-2024)"
+            )
+            validity_date = st.text_input(
+                "**Business Permit Validity**",
+                result.get("Business_Permit_Validity", ""),
+                key=f"{file_key}_validity_date",
+                help="Format: dd-mmm-yyyy (e.g., 31-Dec-2024)"
             )
             official_positions = st.text_area(
-                "Official Titles & Positions",
+                "**Nature of Business**",
                 result.get("Business_Type", ""),
                 key=f"{file_key}_official_positions",
             )
@@ -659,12 +642,14 @@ with col3:
                     updated.update({
                         "Business_Name": business_name,
                         "Business_Owner_Name": owner_name,
+                        "Business_Address": business_address,
                         "Mayor_Name": mayor_name,
                         "Other_Officials": parsed_officials,
                         "Other_Official_Names": "; ".join(legacy_lines),
-                        "Municipal_City_Template": municipality_template,
+                        "Municipality_Template": municipality_template,
                         "Permit_Number": permit_number,
                         "Issue_Date": issue_date,
+                        "Business_Permit_Validity": validity_date,
                         "Business_Type": official_positions,
                         "Name_of_file": os.path.basename(selected_path),
                     })
@@ -683,7 +668,6 @@ with col3:
                     key=f"{file_key}_download_excel",
                 )
 
-        # --- TAB 2: Cleaned Text ---
         with tabs[1]:
             if result.get("cleaned_text"):
                 st.text_area("Cleaned Text", result.get("cleaned_text", ""), height=300, key=f"{file_key}_cleaned_text")
@@ -698,7 +682,6 @@ with col3:
             else:
                 st.info("No cleaned text available.")
 
-        # --- TAB 3: Raw Extracted Text ---
         with tabs[2]:
             if result.get("raw_text"):
                 st.text_area("Raw Extracted Text", result.get("raw_text", ""), height=300, key=f"{file_key}_raw_text")
