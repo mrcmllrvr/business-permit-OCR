@@ -1,3 +1,11 @@
+# main.py - Updated export schema and validity handling (no other logic changed)
+# - Removed "Municipality_City" from exported headers
+# - Renamed columns in export:
+#     Other_Official_Names -> Other_Official_Titles
+#     Business_Permit_Validity -> Validity_Date
+#     Business_Type -> Nature_of_Business
+# - Ensured Validity_Date is always "31-Dec-<year>" (never "[unclear]") using validity year if present, else Issue_Date year, else current year
+
 import concurrent.futures
 import base64
 import os
@@ -41,7 +49,6 @@ headers = {
 
 # --------------------- Image Preprocessing Functions ---------------------
 def convert_pdf_to_images(pdf_path, output_folder):
-    """Step 1: PDF → Image"""
     images = convert_from_path(pdf_path)
     image_paths = []
     for i, image in enumerate(images):
@@ -51,12 +58,6 @@ def convert_pdf_to_images(pdf_path, output_folder):
     return image_paths, len(images)
 
 def preprocess_image(image):
-    """
-    Improve image quality for OCR:
-      - Convert to OpenCV format and grayscale.
-      - Find external contours and crop to the largest contour.
-      - Apply fixed threshold then adaptive thresholding.
-    """
     open_cv_image = np.array(image)
     open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
@@ -74,7 +75,6 @@ def preprocess_image(image):
     return processed_image
 
 def convert_image_to_base64(image_path):
-    """Step 2: Image → Base64"""
     mime_type, _ = guess_type(image_path)
     if mime_type is None:
         mime_type = "application/octet-stream"
@@ -84,7 +84,6 @@ def convert_image_to_base64(image_path):
 
 # Handle both PDF and image files
 def process_image_file(image_path, output_folder):
-    """Process individual image files (JPG, PNG)"""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     processed_image_path = os.path.join(output_folder, f"{base_name}_processed.png")
     image = Image.open(image_path)
@@ -94,7 +93,6 @@ def process_image_file(image_path, output_folder):
 
 # Azure OCR API call to extract raw text from the image
 def get_raw_text(image_data_url):
-    """Perform Azure Document Intelligence OCR on an image data URL."""
     try:
         client = DocumentAnalysisClient(endpoint=adi_endpoint, credential=AzureKeyCredential(adi_api_key))
         if image_data_url.startswith('data:'):
@@ -119,9 +117,6 @@ def get_raw_text(image_data_url):
 
 #--------------------- Text Cleaning Functions ---------------------
 def clean_ocr_text(raw_text, image):
-    """
-    Use Azure OpenAI API to clean and format raw OCR text from Philippine business permits.
-    """
     extracted_text = raw_text
     system_prompt = """
     You are an expert OCR text cleaner specializing in Philippine business permits. Your task is to clean and format the raw OCR text to make it more readable and easier to parse for name extraction and differentiation.
@@ -173,234 +168,230 @@ def parse_structured_response(response_content):
     return None
 
 def get_structured_data_from_text(raw_text):
-    """
-    Extract structured JSON data from the cleaned OCR text of Philippine business permits.
-    Updated with new fields and date format requirements.
-    """
     system_prompt = """
-You are an AI assistant specialized in extracting and differentiating names from Philippine business permits. Your primary goal is to demonstrate advanced AI capabilities in distinguishing between different types of names and entities mentioned in the document.
+        You are an AI assistant specialized in extracting and differentiating names from Philippine business permits. Your primary goal is to demonstrate advanced AI capabilities in distinguishing between different types of names and entities mentioned in the document.
 
-    <user_task>
-    ═══════════════════════════════════════════════════════════════
-    1. PURPOSE AND OUTPUT REQUIREMENTS
-    ═══════════════════════════════════════════════════════════════
-    1.1 Goal: Extract and differentiate names from Philippine business permits with absolute accuracy, focusing on the AI's ability to categorize different types of names and identify municipal/city templates.
+        <user_task>
+        ═══════════════════════════════════════════════════════════════
+        1. PURPOSE AND OUTPUT REQUIREMENTS
+        ═══════════════════════════════════════════════════════════════
+        1.1 Goal: Extract and differentiate names from Philippine business permits with absolute accuracy, focusing on the AI's ability to categorize different types of names and identify municipal/city templates.
 
-    Key Objectives:
-    • Demonstrate AI's capability to differentiate between individual names vs business names vs official names
-    • Parse business permit documents and identify different name categories with context understanding
-    • Identify municipal/city template variations
-    • Extract supporting information like permit numbers, dates, and addresses
-    • Showcase contextual understanding of Filipino naming conventions and business permit formats
-    • Include professional titles (e.g., Atty., Engr., Dr.) with names when present
+        Key Objectives:
+        • Demonstrate AI's capability to differentiate between individual names vs business names vs official names
+        • Parse business permit documents and identify different name categories with context understanding
+        • Identify municipal/city template variations
+        • Extract supporting information like permit numbers, dates, and addresses
+        • Showcase contextual understanding of Filipino naming conventions and business permit formats
+        • Include professional titles (e.g., Atty., Engr., Dr.) with names when present
 
-    1.2 Critical Requirements:
-    • Extract ONLY the specified fields
-    • Strict JSON format – no deviations
-    • Missing fields must be explicitly labeled as "None"
-    • Multi-page documents must be combined into a single structured JSON object
-    • No assumptions or inferences: Only extract what is explicitly visible
-    • PRIMARY FOCUS: Demonstrate NAME DIFFERENTIATION capabilities
-    • Preserve exact spelling of Filipino names and business names
-    • Identify municipal/city template types
-    • Include titles (Atty., Engr., Dr., etc.) with names
-    • ALL dates must be in dd-mmm-yyyy format (e.g., 15-Mar-2024, 01-Jan-2025)
-    • NEVER infer or calculate dates from partial information
+        1.2 Critical Requirements:
+        • Extract ONLY the specified fields
+        • Strict JSON format – no deviations
+        • Missing fields must be explicitly labeled as "None"
+        • Multi-page documents must be combined into a single structured JSON object
+        • No assumptions or inferences: Only extract what is explicitly visible
+        • PRIMARY FOCUS: Demonstrate NAME DIFFERENTIATION capabilities
+        • Preserve exact spelling of Filipino names and business names
+        • Identify municipal/city template types
+        • Include titles (Atty., Engr., Dr., etc.) with names
+        • ALL dates must be in dd-mmm-yyyy format (e.g., 15-Mar-2024, 01-Jan-2025)
+        • NEVER infer or calculate dates from partial information
 
-    ═══════════════════════════════════════════════════════════════
-    2. TEMPLATE IDENTIFICATION
-    ═══════════════════════════════════════════════════════════════
-    Identify the municipal/city template from the following common types:
-    • Manila City
-    • Quezon City
-    • Makati City
-    • Cebu City
-    • Davao City
-    • Pasig City
-    • Taguig City
-    • Antipolo City
-    • Dasmariñas City
-    • Biñan City
-    • Imus City
-    • Cainta
-    • Las Piñas City
-    • Parañaque City
-    • Muntinlupa City
-    • Caloocan City
-    • Marikina City
-    • Pasay City
-    • Valenzuela City
-    • Malabon City
-    • Navotas City
-    • San Juan City
-    • Mandaluyong City
-    • Other Municipal Template
-    • Unknown Template
+        ═══════════════════════════════════════════════════════════════
+        2. TEMPLATE IDENTIFICATION
+        ═══════════════════════════════════════════════════════════════
+        Identify the municipal/city template from the following common types:
+        • Manila City
+        • Quezon City
+        • Makati City
+        • Cebu City
+        • Davao City
+        • Pasig City
+        • Taguig City
+        • Antipolo City
+        • Dasmariñas City
+        • Biñan City
+        • Imus City
+        • Cainta
+        • Las Piñas City
+        • Parañaque City
+        • Muntinlupa City
+        • Caloocan City
+        • Marikina City
+        • Pasay City
+        • Valenzuela City
+        • Malabon City
+        • Navotas City
+        • San Juan City
+        • Mandaluyong City
+        • Other Municipal Template
+        • Unknown Template
 
-    ═══════════════════════════════════════════════════════════════
-    3. NAME DIFFERENTIATION AND EXTRACTION RULES (PRIMARY FOCUS)
-    ═══════════════════════════════════════════════════════════════
-    
-    3.1 Business Owner Name (Individual or Business Entity):
-    • Can be either:
-      - Full name of the individual person who owns/operates the business (e.g., "Atty. Juan dela Cruz", "Maria Santos-Garcia")
-      - OR the business/company name if the owner is a corporate entity (e.g., "ABC Corporation", "XYZ Enterprises, Inc.")
-    • Usually found in "Applicant Name", "Owner", "Proprietor", "Pangalan ng May-ari" sections
-    • Include professional titles when present (Atty., Engr., Dr., etc.)
-    • May include middle names, maiden names, or compound surnames for individuals
-    • Context: This demonstrates AI's ability to identify either individual human names OR business entity names as owners
+        ═══════════════════════════════════════════════════════════════
+        3. NAME DIFFERENTIATION AND EXTRACTION RULES (PRIMARY FOCUS)
+        ═══════════════════════════════════════════════════════════════
+        
+        3.1 Business Owner Name (Individual or Business Entity):
+        • Can be either:
+        - Full name of the individual person who owns/operates the business (e.g., "Atty. Juan dela Cruz", "Maria Santos-Garcia")
+        - OR the business/company name if the owner is a corporate entity (e.g., "ABC Corporation", "XYZ Enterprises, Inc.")
+        • Usually found in "Applicant Name", "Owner", "Proprietor", "Pangalan ng May-ari" sections
+        • Include professional titles when present (Atty., Engr., Dr., etc.)
+        • May include middle names, maiden names, or compound surnames for individuals
+        • Context: This demonstrates AI's ability to identify either individual human names OR business entity names as owners
 
-    3.2 Mayor Name (Government Official):
-    • Full name of the municipal mayor including title if present (e.g., "Atty. Juan dela Cruz")
-    • Often found with official signatures, seals, or "Punong Lungsod/Bayan" designation
-    • Extract the person's name with title
-    • May appear in signature blocks or approval sections
-    • Context: Shows AI can identify specific government official names with titles
+        3.2 Mayor Name (Government Official):
+        • Full name of the municipal mayor including title if present (e.g., "Atty. Juan dela Cruz")
+        • Often found with official signatures, seals, or "Punong Lungsod/Bayan" designation
+        • Extract the person's name with title
+        • May appear in signature blocks or approval sections
+        • Context: Shows AI can identify specific government official names with titles
 
-    3.3 Business Name/Establishment:
-    • Official registered name of the business establishment
-    • Trade names, company names, store names (e.g., "Sari-sari Store ni Maria", "ABC General Merchandise")
-    • May include business type descriptors (Store, Shop, Restaurant, etc.)
-    • May be in English, Filipino, or mixed languages
-    • Context: Demonstrates AI's ability to distinguish business entities from personal names
+        3.3 Business Name/Establishment:
+        • Official registered name of the business establishment
+        • Trade names, company names, store names (e.g., "Sari-sari Store ni Maria", "ABC General Merchandise")
+        • May include business type descriptors (Store, Shop, Restaurant, etc.)
+        • May be in English, Filipino, or mixed languages
+        • Context: Demonstrates AI's ability to distinguish business entities from personal names
 
-    3.4 Business Address:
-    • Complete business address including street, barangay, city/municipality, and province if visible
-    • Extract full address as stated in the permit
-    • Include all address components visible in the document
-    • Format: Street/Building, Barangay, City/Municipality, Province
+        3.4 Business Address:
+        • Complete business address including street, barangay, city/municipality, and province if visible
+        • Extract full address as stated in the permit
+        • Include all address components visible in the document
+        • Format: Street/Building, Barangay, City/Municipality, Province
 
-    3.5 Other Official Names (Government/Municipal Officials):
-    • Names of city/municipal officials mentioned in the document
-    • Department heads, treasurers, assessors, clerks, witnesses
-    • Business permit officers, licensing officers
-    • Anyone with an official government title or position
-    • Include professional titles (Atty., Engr., etc.) with names
-    • List multiple names separated by semicolons if multiple officials are present
-    • Context: Shows AI's contextual understanding of various official roles
-    • Format: "Atty. Roberto Martinez (City Treasurer); Engr. Ana Reyes (Business Permit Officer)"
+        3.5 Other Official Names (Government/Municipal Officials):
+        • Names of city/municipal officials mentioned in the document
+        • Department heads, treasurers, assessors, clerks, witnesses
+        • Business permit officers, licensing officers
+        • Anyone with an official government title or position
+        • Include professional titles (Atty., Engr., etc.) with names
+        • List multiple names separated by semicolons if multiple officials are present
+        • Context: Shows AI's contextual understanding of various official roles
+        • Format: "Atty. Roberto Martinez (City Treasurer); Engr. Ana Reyes (Business Permit Officer)"
 
-    3.6 Supporting Information:
-    • Municipality Template: Specific template format used
-    • Permit Number: Official permit/license number
-    • Issue Date: Date when permit was issued (format: dd-mmm-yyyy)
-      CRITICAL: Only extract if the COMPLETE date (day, month, year) is explicitly visible
-      If incomplete, use "[unclear]"
-    • Business Permit Validity: Validity/expiration date of permit (format: dd-mmm-yyyy)
-      CRITICAL: Only extract if the COMPLETE date (day, month, year) is explicitly visible
-      If incomplete (e.g., only year shown, or "quarter" without specific date), use "[unclear]"
-      NEVER calculate or infer dates from partial information
-      NEVER assume quarter end dates
-    • Business Type: Type of business operation if clearly stated
-    • Municipality/City: Full name of the issuing municipality/city
+        3.6 Supporting Information:
+        • Municipality/City Template: Specific template format used
+        • Permit Number: Official permit/license number
+        • Issue Date: Date when permit was issued (format: dd-mmm-yyyy)
+        CRITICAL: Only extract if the COMPLETE date (day, month, year) is explicitly visible
+        If incomplete, use "[unclear]"
+        • Business Permit Validity: Validity/expiration date of permit (format: dd-mmm-yyyy)
+        CRITICAL: Only extract if the COMPLETE date (day, month, year) is explicitly visible
+        If incomplete (e.g., only year shown, or "quarter" without specific date), use "[unclear]"
+        NEVER calculate or infer dates from partial information
+        NEVER assume quarter end dates
+        • Business Type: Type of business operation if clearly stated
+        • Municipality/City: Full name of the issuing municipality/city
 
-    ═══════════════════════════════════════════════════════════════
-    4. OUTPUT FORMAT
-    ═══════════════════════════════════════════════════════════════
-    Produce a single JSON object containing exactly the following fields:
+        ═══════════════════════════════════════════════════════════════
+        4. OUTPUT FORMAT
+        ═══════════════════════════════════════════════════════════════
+        Produce a single JSON object containing exactly the following fields:
 
-    {
-        "Municipality_Template": "[Manila City|Quezon City|Makati City|Cebu City|Davao City|Pasig City|Taguig City|Antipolo City|Dasmariñas City|Biñan City|Imus City|Cainta|Las Piñas City|Parañaque City|Muntinlupa City|Caloocan City|Marikina City|Pasay City|Valenzuela City|Malabon City|Navotas City|San Juan City|Mandaluyong City|Other Municipal Template|Unknown Template]",
-        "Document_Type": "Philippine Business Permit",
-        "Page_Count": "integer",
-        "Municipality_City": "string",
-        "Business_Owner_Name": "string (individual name with title OR business entity name)",
-        "Mayor_Name": "string (include title if present)", 
-        "Business_Name": "string",
-        "Business_Address": "string",
-        "Other_Official_Names": "string (include titles)",
-        "Permit_Number": "string",
-        "Issue_Date": "string (dd-mmm-yyyy format, or [unclear] if incomplete)",
-        "Business_Permit_Validity": "string (dd-mmm-yyyy format, or [unclear] if incomplete)",
-        "Business_Type": "string"
-    }
+        {
+            "Municipality_Template": "[Manila City|Quezon City|Makati City|Cebu City|Davao City|Pasig City|Taguig City|Antipolo City|Dasmariñas City|Biñan City|Imus City|Cainta|Las Piñas City|Parañaque City|Muntinlupa City|Caloocan City|Marikina City|Pasay City|Valenzuela City|Malabon City|Navotas City|San Juan City|Mandaluyong City|Other Municipal Template|Unknown Template]",
+            "Document_Type": "Philippine Business Permit",
+            "Page_Count": "integer",
+            "Municipality_City": "string",
+            "Business_Owner_Name": "string (individual name with title OR business entity name)",
+            "Mayor_Name": "string (include title if present)", 
+            "Business_Name": "string",
+            "Business_Address": "string",
+            "Other_Official_Names": "string (include titles)",
+            "Permit_Number": "string",
+            "Issue_Date": "string (dd-mmm-yyyy format, or [unclear] if incomplete)",
+            "Business_Permit_Validity": "string (dd-mmm-yyyy format, or [unclear] if incomplete)",
+            "Business_Type": "string"
+        }
 
-    Notes:  
-    • Mark any field explicitly absent as "None"
-    • If data is visible but unclear, use "[unclear]"
-    • Ensure no extraneous keys are added
-    • PRIMARY FOCUS: Accurate name differentiation to showcase AI capability
-    • Use underscore format for field names to ensure Excel compatibility
-    • Always include professional titles (Atty., Engr., Dr., etc.) with names when visible
-    • Format ALL dates as dd-mmm-yyyy (e.g., 15-Mar-2024, 01-Jan-2025, 31-Dec-2024)
+        Notes:  
+        • Mark any field explicitly absent as "None"
+        • If data is visible but unclear, use "[unclear]"
+        • Ensure no extraneous keys are added
+        • PRIMARY FOCUS: Accurate name differentiation to showcase AI capability
+        • Use underscore format for field names to ensure Excel compatibility
+        • Always include professional titles (Atty., Engr., Dr., etc.) with names when visible
+        • Format ALL dates as dd-mmm-yyyy (e.g., 15-Mar-2024, 01-Jan-2025, 31-Dec-2024)
 
-    ═══════════════════════════════════════════════════════════════
-    5. DATE EXTRACTION RULES - STRICT COMPLIANCE REQUIRED
-    ═══════════════════════════════════════════════════════════════
+        ═══════════════════════════════════════════════════════════════
+        5. DATE EXTRACTION RULES - STRICT COMPLIANCE REQUIRED
+        ═══════════════════════════════════════════════════════════════
 
-    For Issue_Date and Business_Permit_Validity fields:
+        For Issue_Date and Business_Permit_Validity fields:
 
-    ONLY extract dates that are COMPLETELY and EXPLICITLY visible with ALL three components:
-    • Full day number (01-31)
-    • Full month name or abbreviation
-    • Full year (4 digits)
+        ONLY extract dates that are COMPLETELY and EXPLICITLY visible with ALL three components:
+        • Full day number (01-31)
+        • Full month name or abbreviation
+        • Full year (4 digits)
 
-    If ANY component is missing, unclear, or requires inference:
-    • Return "[unclear]" 
-    • DO NOT calculate quarter end dates
-    • DO NOT infer missing day/month values
-    • DO NOT assume dates from partial information
-    • DO NOT convert "end of quarter" to specific dates
+        If ANY component is missing, unclear, or requires inference:
+        • Return "[unclear]" 
+        • DO NOT calculate quarter end dates
+        • DO NOT infer missing day/month values
+        • DO NOT assume dates from partial information
+        • DO NOT convert "end of quarter" to specific dates
 
-    Valid Examples:
-    ✓ "December 31, 2018" → "31-Dec-2018"
-    ✓ "15 March 2024" → "15-Mar-2024"
-    ✓ "May 24, 2018" → "24-May-2018"
-    
-    Invalid Examples (use "[unclear]"):
-    ✗ "End of 2018" → "[unclear]" (day/month missing)
-    ✗ "Q3 2018" → "[unclear]" (specific date not visible)
-    ✗ "___ QUARTER, 2018" → "[unclear]" (incomplete information)
-    ✗ "VALID UNTIL THE END OF ___ QUARTER, 2018" → "[unclear]" (quarter not specified, date incomplete)
-    ✗ "2018" → "[unclear]" (only year visible)
-    ✗ "December 2018" → "[unclear]" (day missing)
+        Valid Examples:
+        ✓ "December 31, 2018" → "31-Dec-2018"
+        ✓ "15 March 2024" → "15-Mar-2024"
+        ✓ "May 24, 2018" → "24-May-2018"
+        
+        Invalid Examples (use "[unclear]"):
+        ✗ "End of 2018" → "[unclear]" (day/month missing)
+        ✗ "Q3 2018" → "[unclear]" (specific date not visible)
+        ✗ "___ QUARTER, 2018" → "[unclear]" (incomplete information)
+        ✗ "VALID UNTIL THE END OF ___ QUARTER, 2018" → "[unclear]" (quarter not specified, date incomplete)
+        ✗ "2018" → "[unclear]" (only year visible)
+        ✗ "December 2018" → "[unclear]" (day missing)
 
-    REMEMBER: When in doubt, use "[unclear]". Never guess or calculate dates.
+        REMEMBER: When in doubt, use "[unclear]". Never guess or calculate dates.
 
-    ═══════════════════════════════════════════════════════════════
-    6. OUTPUT EXAMPLE (Demonstrating Name Differentiation)
-    ═══════════════════════════════════════════════════════════════
-    {
-        "Municipality_Template": "Dasmariñas City",
-        "Document_Type": "Philippine Business Permit",
-        "Page_Count": "1",
-        "Municipality_City": "Dasmariñas City, Cavite",
-        "Business_Owner_Name": "Maria Santos-Cruz",
-        "Mayor_Name": "Atty. Jennifer Austria Barzaga",
-        "Business_Name": "Santos General Merchandise and Sari-sari Store",
-        "Business_Address": "123 Main Street, Barangay Salitran, Dasmariñas City, Cavite",
-        "Other_Official_Names": "Engr. Roberto Martinez (City Treasurer); Atty. Ana Reyes (Business Permit Officer); Jose Garcia (Department Head)",
-        "Permit_Number": "BP-2024-001234",
-        "Issue_Date": "15-Mar-2024",
-        "Business_Permit_Validity": "31-Dec-2024",
-        "Business_Type": "General Merchandise"
-    }
+        ═══════════════════════════════════════════════════════════════
+        6. OUTPUT EXAMPLE (Demonstrating Name Differentiation)
+        ═══════════════════════════════════════════════════════════════
+        {
+            "Municipality_Template": "Dasmariñas City",
+            "Document_Type": "Philippine Business Permit",
+            "Page_Count": "1",
+            "Municipality_City": "Dasmariñas City, Cavite",
+            "Business_Owner_Name": "Maria Santos-Cruz",
+            "Mayor_Name": "Atty. Jennifer Austria Barzaga",
+            "Business_Name": "Santos General Merchandise and Sari-sari Store",
+            "Business_Address": "123 Main Street, Barangay Salitran, Dasmariñas City, Cavite",
+            "Other_Official_Names": "Engr. Roberto Martinez (City Treasurer); Atty. Ana Reyes (Business Permit Officer); Jose Garcia (Department Head)",
+            "Permit_Number": "BP-2024-001234",
+            "Issue_Date": "15-Mar-2024",
+            "Business_Permit_Validity": "31-Dec-2024",
+            "Business_Type": "General Merchandise"
+        }
 
-    ═══════════════════════════════════════════════════════════════
-    7. CRITICAL NOTES FOR NAME DIFFERENTIATION DEMONSTRATION
-    ═══════════════════════════════════════════════════════════════
-    • Individual vs Entity Recognition: The AI must clearly distinguish between personal names (individuals) and business entity names
-    • Business Owner can be EITHER an individual person OR a business/corporate entity
-    • Contextual Understanding: Use document structure, Filipino naming conventions, and official titles to aid proper categorization
-    • Multiple Name Handling: When multiple officials are mentioned, demonstrate the ability to list and categorize them appropriately
-    • Cultural Sensitivity: Preserve Filipino naming conventions including compound surnames, maiden names, and traditional naming patterns
-    • Template Recognition: Identify different municipal templates to show document format understanding
-    • Title Inclusion: Always include professional titles (Atty., Engr., Dr., etc.) when present in the document
-    • Date Extraction: ONLY extract complete dates. Use "[unclear]" for any incomplete date information
-    • Address Extraction: Extract complete business address with all visible components
-    • The PRIMARY SUCCESS METRIC is the AI's demonstrated ability to correctly differentiate between different types of names based on context
+        ═══════════════════════════════════════════════════════════════
+        7. CRITICAL NOTES FOR NAME DIFFERENTIATION DEMONSTRATION
+        ═══════════════════════════════════════════════════════════════
+        • Individual vs Entity Recognition: The AI must clearly distinguish between personal names (individuals) and business entity names
+        • Business Owner can be EITHER an individual person OR a business/corporate entity
+        • Contextual Understanding: Use document structure, Filipino naming conventions, and official titles to aid proper categorization
+        • Multiple Name Handling: When multiple officials are mentioned, demonstrate the ability to list and categorize them appropriately
+        • Cultural Sensitivity: Preserve Filipino naming conventions including compound surnames, maiden names, and traditional naming patterns
+        • Template Recognition: Identify different municipal templates to show document format understanding
+        • Title Inclusion: Always include professional titles (Atty., Engr., Dr., etc.) when present in the document
+        • Date Extraction: ONLY extract complete dates. Use "[unclear]" for any incomplete date information
+        • Address Extraction: Extract complete business address with all visible components
+        • The PRIMARY SUCCESS METRIC is the AI's demonstrated ability to correctly differentiate between different types of names based on context
 
-    </user_task>
+        </user_task>
 
-    Please follow these steps:
+        Please follow these steps:
 
-    1. Initial Attempt:
-    Make an initial attempt at completing the task focusing on name differentiation. Present this attempt in <initial_attempt> tags with JSON format.
+        1. Initial Attempt:
+        Make an initial attempt at completing the task focusing on name differentiation. Present this attempt in <initial_attempt> tags with JSON format.
 
-    2. Final Answer:
-    Present your final JSON answer in <answer> tags after analysis.
+        2. Final Answer:
+        Present your final JSON answer in <answer> tags after analysis.
+
     """
-
     try:
         data = {
             "messages": [
@@ -424,15 +415,11 @@ You are an AI assistant specialized in extracting and differentiating names from
         print(f"Unexpected error: {e}")
     return None
 
-
 def standardize_date(date_str):
-    """Convert date to dd-mmm-yyyy format"""
+    """(unchanged) Convert date to dd-mmm-yyyy format"""
     if not date_str or date_str in ["missing", "[unclear]"]:
         return date_str
-    
     date_str = date_str.strip().replace("-", "/").replace(".", "/")
-    
-    # Try various date patterns
     patterns = [
         ('%Y/%m/%d', None),
         ('%d/%m/%Y', None),
@@ -441,14 +428,12 @@ def standardize_date(date_str):
         ('%d-%m-%Y', None),
         ('%m-%d-%Y', None),
     ]
-    
     for pattern, _ in patterns:
         try:
             dt = datetime.strptime(date_str.replace("/", "-"), pattern.replace("/", "-"))
             return dt.strftime('%d-%b-%Y')
         except ValueError:
             continue
-    
     return "[unclear]"
 
 def merge_json_objects(json_objects, page_count):
@@ -477,31 +462,68 @@ def flatten_json(nested_json):
             flat[key] = value
     return flat
 
+# NEW: helpers for export mapping
+def _extract_year(s: str | None) -> int | None:
+    if not s:
+        return None
+    m = re.search(r"(19|20)\d{2}", s)
+    return int(m.group(0)) if m else None
+
+def _validity_31_dec(issue_date: str | None, validity_raw: str | None) -> str:
+    y = _extract_year(validity_raw) or _extract_year(issue_date) or datetime.now().year
+    return f"31-Dec-{y}"
+
 def save_to_excel(structured_data_list, excel_output_path):
+    # Column names mirror UI labels with spaces -> underscores, in the exact order requested
     csv_headers = [
-        "Municipality_Template",
         "Document_Type",
         "Page_Count",
         "Name_of_file",
-        "Municipality_City",
-        "Business_Owner_Name",
-        "Mayor_Name",
-        "Business_Name",
+        "Business_Name_Establishment",
+        "Business_Owner",
         "Business_Address",
+        "Mayor_Name",
         "Other_Official_Names",
-        "Other_Officials",
+        "Other_Official_Titles",
+        "Municipality_City_Template",
         "Permit_Number",
         "Issue_Date",
-        "Business_Permit_Validity",
-        "Business_Type",
+        "Validity_Date",
+        "Nature_of_Business",
         "raw_text",
-        "cleaned_text"
+        "cleaned_text",
     ]
+
     flat_data_list = []
     for item in structured_data_list:
         flat = flatten_json(item)
-        if isinstance(flat.get("Other_Officials"), (list, dict)):
-            flat["Other_Officials"] = json.dumps(flat["Other_Officials"], ensure_ascii=False)
+
+        # Map UI-aligned columns
+        flat["Business_Name_Establishment"] = flat.get("Business_Name")
+        flat["Business_Owner"] = flat.get("Business_Owner_Name")
+        flat["Other_Official_Names"] = flat.get("Other_Official_Names", "")
+        # Titles (derive from structured list if present)
+        other_off = flat.get("Other_Officials")
+        if isinstance(other_off, (list, dict)):
+            try:
+                # ensure JSON string for persistence, but "Titles" column expects readable list (semicolon-separated)
+                titles_list = []
+                if isinstance(other_off, list):
+                    titles_list = [ (o.get("title") or "").strip() for o in other_off if (o.get("title") or "").strip() ]
+                flat["Other_Official_Titles"] = "; ".join(titles_list)
+                flat["Other_Officials"] = json.dumps(other_off, ensure_ascii=False)
+            except Exception:
+                flat["Other_Official_Titles"] = ""
+        else:
+            flat["Other_Official_Titles"] = flat.get("Other_Official_Titles", "")
+
+        # Municipality/City Template
+        flat["Municipality_City_Template"] = flat.get("Municipality_Template") or flat.get("Municipality_City") or ""
+
+        # Nature of Business & Validity Date (computed)
+        flat["Nature_of_Business"] = flat.get("Business_Type")
+        flat["Validity_Date"] = _validity_31_dec(flat.get("Issue_Date"), flat.get("Business_Permit_Validity"))
+
         flat_data_list.append(flat)
 
     df = pd.DataFrame(flat_data_list)
@@ -512,6 +534,7 @@ def save_to_excel(structured_data_list, excel_output_path):
     df.to_excel(excel_output_path, index=False)
     print(f"Excel file saved to: {excel_output_path}")
 
+
 # --------- Helper: derive structured officials list from cleaned text or legacy string ----------
 ROLE_HINTS = [
     "officer", "treasurer", "licensing", "assessor", "clerk", "mayor",
@@ -520,15 +543,11 @@ ROLE_HINTS = [
 ]
 
 def derive_official_pairs(structured_data, cleaned_text):
-    """Return list[{name,title}] derived from structured Other_Official_Names or cleaned_text."""
     pairs = []
-
-    # 1) Prefer parsing the structured "Other_Official_Names" if it carries (Title) info
     legacy = (structured_data or {}).get("Other_Official_Names") or ""
     if legacy:
         parts = [p.strip() for p in legacy.split(";") if p.strip()]
         for p in parts:
-            # support "Name (Title)" and "Name - Title"
             if "(" in p and ")" in p and p.find("(") < p.find(")"):
                 name = p[:p.find("(")].strip()
                 title = p[p.find("(")+1:p.find(")")].strip()
@@ -538,16 +557,12 @@ def derive_official_pairs(structured_data, cleaned_text):
                 pairs.append({"name": name.strip(), "title": title.strip()})
             else:
                 pairs.append({"name": p, "title": ""})
-
-    # 2) If nothing found yet, do a light heuristic on cleaned text (neighboring lines)
     if not pairs and cleaned_text:
         lines = [ln.strip() for ln in cleaned_text.splitlines() if ln.strip()]
         for i in range(len(lines) - 1):
             nm, nxt = lines[i], lines[i+1]
-            # crude name test: has spaces and letters; title line contains role keywords
             if re.search(r"[A-Za-z]\s+[A-Za-z]", nm) and any(h in nxt.lower() for h in ROLE_HINTS):
                 pairs.append({"name": nm, "title": nxt})
-
     return pairs
 
 # --------------------- PDF/Image processing ---------------------
@@ -561,7 +576,7 @@ def process_pdf(pdf_file, pdf_folder, image_folder):
     for image_path in image_paths:
         image = Image.open(image_path)
         processed_image = preprocess_image(image)
-        processed_image.save(image_path)  # overwrite with processed version
+        processed_image.save(image_path)
 
         base64_data = convert_image_to_base64(image_path)
         raw_text_image = get_raw_text(base64_data)
@@ -583,8 +598,6 @@ def process_pdf(pdf_file, pdf_folder, image_folder):
         structured_data["Page_Count"] = page_count
         structured_data["raw_text"] = raw_text
         structured_data["cleaned_text"] = cleaned_text
-
-        # NEW: build structured Other_Officials list if possible
         structured_data["Other_Officials"] = derive_official_pairs(structured_data, cleaned_text)
 
     return structured_data
@@ -618,8 +631,6 @@ def process_image(image_file, image_input_folder, image_output_folder):
         structured_data["Page_Count"] = page_count
         structured_data["raw_text"] = raw_text
         structured_data["cleaned_text"] = cleaned_text
-
-        # NEW: build structured Other_Officials list if possible
         structured_data["Other_Officials"] = derive_official_pairs(structured_data, cleaned_text)
 
     return structured_data

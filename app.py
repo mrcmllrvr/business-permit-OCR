@@ -1,4 +1,29 @@
-# app.py - Updated with bold labels, new fields, and date format changes
+# app.py - Updated per request:
+# - Business Permit Validity field auto-fills "31-Dec-<same year>" and never shows "[unclear]"
+# - Removed "Refresh All" and "Reset Cache" buttons
+# - Exported Excel: UI-aligned headers (spaces -> underscores) and exact order requested
+#   Column set/order:
+#     Document_Type
+#     Page_Count
+#     Name_of_file
+#     Business_Name_Establishment
+#     Business_Owner
+#     Business_Address
+#     Mayor_Name
+#     Other_Official_Names
+#     Other_Official_Titles
+#     Municipality_City_Template
+#     Permit_Number
+#     Issue_Date
+#     Validity_Date
+#     Nature_of_Business
+#     raw_text
+#     cleaned_text
+#
+# - Rules for Other_Official_Titles:
+#     If Other_Official_Names is "None" (or "", "null"), export literal "None".
+#     Else, collect titles from parsed list or legacy string; if none found, export "None".
+
 import streamlit as st
 import os
 import io
@@ -7,6 +32,7 @@ import pandas as pd
 import traceback
 import time
 import concurrent.futures
+from datetime import datetime   # NEW: for validity computation
 
 st.set_page_config(page_title="Business Permit Data Intelligence Engine", layout="wide", initial_sidebar_state="expanded")
 st.title("🏢 Business Permit Data Intelligence Engine")
@@ -253,17 +279,116 @@ def _file_sig(path):
     except (FileNotFoundError, OSError):
         return None
 
+# --- Validity helpers: guarantee "31-Dec-<year>" (no [unclear]) ---
+def _extract_year(s: str) -> int | None:
+    if not s:
+        return None
+    import re
+    m = re.search(r"(19|20)\d{2}", s)
+    return int(m.group(0)) if m else None
+
+def _validity_31_dec(issue_date: str, validity_raw: str) -> str:
+    # Prefer any explicit year from validity, else fall back to Issue_Date year, else current year
+    y = _extract_year(validity_raw) or _extract_year(issue_date) or datetime.now().year
+    return f"31-Dec-{y}"
+
+# --- Titles helper (with legacy fallback) ---
+def _collect_official_titles(data: dict) -> str:
+    """Return semicolon-separated titles. Prefer parsed list, else parse legacy string."""
+    titles = []
+
+    # 1) From parsed list
+    other_off = data.get("Other_Officials")
+    if isinstance(other_off, list):
+        for o in other_off:
+            t = (o.get("title") or "").strip()
+            if t:
+                titles.append(t)
+
+    # 2) Fallback: parse legacy "Other_Official_Names"
+    if not titles:
+        legacy = (data.get("Other_Official_Names") or "").strip()
+        if legacy:
+            parts = [p.strip() for p in legacy.split(";") if p.strip()]
+            for p in parts:
+                # Pattern A: "Name (Title)"
+                if "(" in p and ")" in p and p.find("(") < p.find(")"):
+                    t = p[p.find("(")+1:p.find(")")].strip()
+                    if t:
+                        titles.append(t)
+                # Pattern B: "Name - Title"
+                elif " - " in p:
+                    _, title = p.split(" - ", 1)
+                    t = title.strip()
+                    if t:
+                        titles.append(t)
+
+    # De-dup while preserving order
+    seen, deduped = set(), []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return "; ".join(deduped)
+
 def excel_bytes_for_single_doc(data: dict) -> bytes:
+    # UI field names with spaces -> underscores, in the requested order
     cols = [
-        "Municipality_Template","Document_Type","Page_Count","Name_of_file",
-        "Municipality_City","Business_Owner_Name","Mayor_Name","Business_Name",
-        "Business_Address","Other_Official_Names","Other_Officials","Permit_Number",
-        "Issue_Date","Business_Permit_Validity","Business_Type",
-        "raw_text","cleaned_text"
+        "Document_Type",
+        "Page_Count",
+        "Name_of_file",
+        "Business_Name_Establishment",
+        "Business_Owner",
+        "Business_Address",
+        "Mayor_Name",
+        "Other_Official_Names",
+        "Other_Official_Titles",
+        "Municipality_City_Template",
+        "Permit_Number",
+        "Issue_Date",
+        "Validity_Date",
+        "Nature_of_Business",
+        "raw_text",
+        "cleaned_text",
     ]
-    row = {c: data.get(c, "") for c in cols}
-    if isinstance(row.get("Other_Officials"), (list, dict)):
-        row["Other_Officials"] = json.dumps(row["Other_Officials"], ensure_ascii=False)
+
+    row = {c: "" for c in cols}
+    row["Document_Type"] = data.get("Document_Type", "")
+    row["Page_Count"] = data.get("Page_Count", "")
+    row["Name_of_file"] = data.get("Name_of_file", "")
+
+    # UI label: "Business Name/Establishment"
+    row["Business_Name_Establishment"] = data.get("Business_Name", "")
+    # UI label: "Business Owner"
+    row["Business_Owner"] = data.get("Business_Owner_Name", "")
+    # UI label: "Business Address"
+    row["Business_Address"] = data.get("Business_Address", "")
+    # UI label: "Mayor Name"
+    row["Mayor_Name"] = data.get("Mayor_Name", "")
+    # UI label: "Other Official Names"
+    row["Other_Official_Names"] = data.get("Other_Official_Names", "")
+
+    # Titles with literal 'None' rule
+    names_str = str(row["Other_Official_Names"]).strip().lower()
+    if names_str in ["none", "null", ""]:
+        row["Other_Official_Titles"] = "None"
+    else:
+        row["Other_Official_Titles"] = _collect_official_titles(data) or "None"
+
+    # UI label: "Municipality/City Template"
+    row["Municipality_City_Template"] = data.get("Municipality_Template", data.get("Municipality_City", ""))
+    # UI label: "Permit Number"
+    row["Permit_Number"] = data.get("Permit_Number", "")
+    # UI label: "Issue Date"
+    row["Issue_Date"] = data.get("Issue_Date", "")
+    # UI label: "Validity Date" (always 31-Dec-<year>)
+    row["Validity_Date"] = _validity_31_dec(row["Issue_Date"], data.get("Business_Permit_Validity", ""))
+    # UI label: "Nature of Business"
+    row["Nature_of_Business"] = data.get("Business_Type", "")
+
+    row["raw_text"] = data.get("raw_text", "")
+    row["cleaned_text"] = data.get("cleaned_text", "")
+
     df = pd.DataFrame([row], columns=cols)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -271,23 +396,61 @@ def excel_bytes_for_single_doc(data: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
+
 def excel_bytes_for_all_docs(cache: dict) -> bytes:
     cols = [
-        "Municipality_Template","Document_Type","Page_Count","Name_of_file",
-        "Municipality_City","Business_Owner_Name","Mayor_Name","Business_Name",
-        "Business_Address","Other_Official_Names","Other_Officials","Permit_Number",
-        "Issue_Date","Business_Permit_Validity","Business_Type",
-        "raw_text","cleaned_text"
+        "Document_Type",
+        "Page_Count",
+        "Name_of_file",
+        "Business_Name_Establishment",
+        "Business_Owner",
+        "Business_Address",
+        "Mayor_Name",
+        "Other_Official_Names",
+        "Other_Official_Titles",
+        "Municipality_City_Template",
+        "Permit_Number",
+        "Issue_Date",
+        "Validity_Date",
+        "Nature_of_Business",
+        "raw_text",
+        "cleaned_text",
     ]
     rows = []
     for entry in cache.values():
         data = (entry or {}).get("result")
         if not data:
             continue
-        row = {c: data.get(c, "") for c in cols}
-        if isinstance(row.get("Other_Officials"), (list, dict)):
-            row["Other_Officials"] = json.dumps(row["Other_Officials"], ensure_ascii=False)
+
+        row = {c: "" for c in cols}
+        row["Document_Type"] = data.get("Document_Type", "")
+        row["Page_Count"] = data.get("Page_Count", "")
+        row["Name_of_file"] = data.get("Name_of_file", "")
+
+        row["Business_Name_Establishment"] = data.get("Business_Name", "")
+        row["Business_Owner"] = data.get("Business_Owner_Name", "")
+        row["Business_Address"] = data.get("Business_Address", "")
+        row["Mayor_Name"] = data.get("Mayor_Name", "")
+
+        # Names & Titles (with literal 'None' rule)
+        row["Other_Official_Names"] = data.get("Other_Official_Names", "")
+        names_str = str(row["Other_Official_Names"]).strip().lower()
+        if names_str in ["none", "null", ""]:
+            row["Other_Official_Titles"] = "None"
+        else:
+            row["Other_Official_Titles"] = _collect_official_titles(data) or "None"
+
+        row["Municipality_City_Template"] = data.get("Municipality_Template", data.get("Municipality_City", ""))
+        row["Permit_Number"] = data.get("Permit_Number", "")
+        row["Issue_Date"] = data.get("Issue_Date", "")
+        row["Validity_Date"] = _validity_31_dec(row["Issue_Date"], data.get("Business_Permit_Validity", ""))
+        row["Nature_of_Business"] = data.get("Business_Type", "")
+
+        row["raw_text"] = data.get("raw_text", "")
+        row["cleaned_text"] = data.get("cleaned_text", "")
+
         rows.append(row)
+
     df = pd.DataFrame(rows, columns=cols)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -483,13 +646,14 @@ with st.sidebar:
         key="sb_download_all",
     )
 
-    if st.button("Refresh All", key="sb_reprocess"):
-        st.session_state["cache"].clear()
-        st.rerun()
-
-    if st.button("Reset Cache", key="sb_clear_cache"):
-        st.session_state["cache"].clear()
-        st.rerun()
+    # REMOVED per request:
+    # if st.button("Refresh All", key="sb_reprocess"):
+    #     st.session_state["cache"].clear()
+    #     st.rerun()
+    #
+    # if st.button("Reset Cache", key="sb_clear_cache"):
+    #     st.session_state["cache"].clear()
+    #     st.rerun()
 
 selected_path = st.session_state.get("selected_file_path")
 result = st.session_state["cache"].get(selected_path, {}).get("result") if selected_path else None
@@ -544,7 +708,7 @@ with col2:
     st.markdown("", unsafe_allow_html=True)
 
 with col3:
-    st.subheader("Extracted Data (editable)")
+    st.subheader("Extracted Data")
     if not result:
         st.info("No extracted data yet. If you just uploaded, processing should complete shortly.")
     elif not selected_path:
@@ -598,7 +762,7 @@ with col3:
             )
 
             municipality_template = st.text_input(
-                "**Municipality Template**",
+                "**Municipality/City Template**",
                 result.get("Municipality_Template", result.get("Municipality_City", "")),
                 key=f"{file_key}_municipal_template",
             )
@@ -611,12 +775,16 @@ with col3:
                 key=f"{file_key}_issue_date",
                 help="Format: dd-mmm-yyyy (e.g., 15-Mar-2024)"
             )
+
+            # UPDATED: validity always shows "31-Dec-<same year>" (never "[unclear]")
+            validity_default = _validity_31_dec(result.get("Issue_Date", ""), result.get("Business_Permit_Validity", ""))
             validity_date = st.text_input(
-                "**Business Permit Validity**",
-                result.get("Business_Permit_Validity", ""),
+                "**Validity Date**",
+                validity_default,
                 key=f"{file_key}_validity_date",
-                help="Format: dd-mmm-yyyy (e.g., 31-Dec-2024)"
+                help="Auto-set to 31-Dec-<year>."
             )
+
             official_positions = st.text_area(
                 "**Nature of Business**",
                 result.get("Business_Type", ""),
@@ -645,11 +813,11 @@ with col3:
                         "Business_Address": business_address,
                         "Mayor_Name": mayor_name,
                         "Other_Officials": parsed_officials,
-                        "Other_Official_Names": "; ".join(legacy_lines),
+                        "Other_Official_Names": "; ".join(legacy_lines) if legacy_lines else "None",
                         "Municipality_Template": municipality_template,
                         "Permit_Number": permit_number,
                         "Issue_Date": issue_date,
-                        "Business_Permit_Validity": validity_date,
+                        "Business_Permit_Validity": validity_date,  # remains internal, export maps it
                         "Business_Type": official_positions,
                         "Name_of_file": os.path.basename(selected_path),
                     })
